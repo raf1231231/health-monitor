@@ -281,23 +281,41 @@ function statusColor(status) {
   return RD;
 }
 
+function statusIcon(status) {
+  if (status === STATUS.UP) return `${GR}●${R}`;
+  if (status === STATUS.SLOW) return `${YL}●${R}`;
+  return `${RD}●${R}`;
+}
+
+function formatCheckedAt(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+}
+
 function printResults(data) {
   const { results, summary, checkedAt } = data;
-  const time = new Date(checkedAt).toLocaleTimeString();
+  const time = new Date(checkedAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 
   console.log(`\n${B}${CY}⚡ Health Monitor${R}  ${GY}${time}${R}\n`);
-  console.log(`${GY}${'─'.repeat(70)}${R}`);
-  console.log(`  ${B}${'Service'.padEnd(22)}${'Status'.padEnd(10)}${'Time'.padEnd(10)}Detail${R}`);
-  console.log(`${GY}${'─'.repeat(70)}${R}`);
+
+  // Column widths
+  const W = { name: 22, status: 10, time: 10, checked: 12 };
+  const lineW = 2 + W.name + W.status + W.time + W.checked + 14; // +14 for "Detail" col
+
+  console.log(`${GY}${'─'.repeat(lineW)}${R}`);
+  console.log(`  ${B}${'Service'.padEnd(W.name)}${'Status'.padEnd(W.status)}${'Time'.padEnd(W.time)}${'Checked'.padEnd(W.checked)}Detail${R}`);
+  console.log(`${GY}${'─'.repeat(lineW)}${R}`);
 
   for (const r of results) {
     const color = statusColor(r.status);
+    const icon = statusIcon(r.status);
     const name = r.name.length > 20 ? r.name.slice(0, 20) + '…' : r.name;
     const timeStr = `${r.responseTime}ms`;
-    console.log(`  ${name.padEnd(22)}${color}${r.status.padEnd(10)}${R}${timeStr.padEnd(10)}${GY}${r.detail}${R}`);
+    const checked = formatCheckedAt(r.checkedAt);
+    console.log(`  ${name.padEnd(W.name)}${icon} ${color}${r.status.padEnd(W.status - 2)}${R}${timeStr.padEnd(W.time)}${GY}${checked.padEnd(W.checked)}${r.detail}${R}`);
   }
 
-  console.log(`${GY}${'─'.repeat(70)}${R}`);
+  console.log(`${GY}${'─'.repeat(lineW)}${R}`);
   const statusLine = [
     `${GR}${summary.up} up${R}`,
     summary.slow > 0 ? `${YL}${summary.slow} slow${R}` : null,
