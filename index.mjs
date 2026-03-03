@@ -11,7 +11,7 @@
  *   node index.mjs --json       # Output raw JSON
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
@@ -19,6 +19,8 @@ import net from 'node:net';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVICES_PATH = join(__dirname, 'services.json');
+const HISTORY_PATH = join(__dirname, 'history.json');
+const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 // ── Status Constants ────────────────────────────────────────────────────
 const STATUS = { UP: 'UP', DOWN: 'DOWN', SLOW: 'SLOW' };
@@ -273,6 +275,91 @@ export async function check(options = {}) {
   };
 }
 
+// ── History Log ─────────────────────────────────────────────────────────
+
+function loadHistory() {
+  if (!existsSync(HISTORY_PATH)) return [];
+  try {
+    return JSON.parse(readFileSync(HISTORY_PATH, 'utf8'));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Append check results to history.json and prune entries older than 7 days.
+ * Stores compact snapshots: { checkedAt, results: [{ name, status, responseTime }] }
+ */
+function appendHistory(data) {
+  const history = loadHistory();
+  history.push({
+    checkedAt: data.checkedAt,
+    results: data.results.map(r => ({
+      name: r.name,
+      status: r.status,
+      responseTime: r.responseTime,
+    })),
+  });
+  // Prune entries older than 7 days
+  const cutoff = Date.now() - HISTORY_MAX_AGE_MS;
+  const pruned = history.filter(entry => new Date(entry.checkedAt).getTime() > cutoff);
+  writeFileSync(HISTORY_PATH, JSON.stringify(pruned, null, 2));
+}
+
+/**
+ * Compute and print uptime % per service over the last 24 hours.
+ */
+function printHistory() {
+  const history = loadHistory();
+  const cutoff24h = Date.now() - 24 * 60 * 60 * 1000;
+  const recent = history.filter(entry => new Date(entry.checkedAt).getTime() > cutoff24h);
+
+  if (recent.length === 0) {
+    console.log(`\n${B}${CY}⚡ Health Monitor — History${R}\n`);
+    console.log(`  ${YL}No history data available.${R} Run some checks first.\n`);
+    return;
+  }
+
+  // Aggregate per service: { name -> { up, total, totalMs, checks } }
+  const stats = {};
+  for (const entry of recent) {
+    for (const r of entry.results) {
+      if (!stats[r.name]) stats[r.name] = { up: 0, total: 0, totalMs: 0, lastStatus: null, lastChecked: null };
+      stats[r.name].total++;
+      if (r.status !== STATUS.DOWN) stats[r.name].up++;
+      stats[r.name].totalMs += r.responseTime;
+      stats[r.name].lastStatus = r.status;
+      stats[r.name].lastChecked = entry.checkedAt;
+    }
+  }
+
+  const oldest = new Date(recent[0].checkedAt);
+  const newest = new Date(recent[recent.length - 1].checkedAt);
+  const spanHrs = Math.max(0.1, (newest - oldest) / (1000 * 60 * 60));
+
+  console.log(`\n${B}${CY}⚡ Health Monitor — 24h Uptime${R}  ${GY}(${recent.length} checks over ${spanHrs.toFixed(1)}h)${R}\n`);
+
+  const W = { name: 22, uptime: 12, avg: 10, checks: 10, current: 10 };
+  const lineW = 2 + W.name + W.uptime + W.avg + W.checks + W.current;
+
+  console.log(`${GY}${'─'.repeat(lineW)}${R}`);
+  console.log(`  ${B}${'Service'.padEnd(W.name)}${'Uptime'.padEnd(W.uptime)}${'Avg ms'.padEnd(W.avg)}${'Checks'.padEnd(W.checks)}Current${R}`);
+  console.log(`${GY}${'─'.repeat(lineW)}${R}`);
+
+  for (const [name, s] of Object.entries(stats)) {
+    const pct = (s.up / s.total * 100);
+    const pctStr = pct.toFixed(1) + '%';
+    const avgMs = Math.round(s.totalMs / s.total) + 'ms';
+    const color = pct >= 99 ? GR : pct >= 90 ? YL : RD;
+    const curIcon = statusIcon(s.lastStatus);
+    const displayName = name.length > 20 ? name.slice(0, 20) + '…' : name;
+
+    console.log(`  ${displayName.padEnd(W.name)}${color}${pctStr.padEnd(W.uptime)}${R}${avgMs.padEnd(W.avg)}${GY}${String(s.total).padEnd(W.checks)}${R}${curIcon} ${statusColor(s.lastStatus)}${s.lastStatus}${R}`);
+  }
+
+  console.log(`${GY}${'─'.repeat(lineW)}${R}\n`);
+}
+
 // ── CLI Entrypoint ──────────────────────────────────────────────────────
 
 function statusColor(status) {
@@ -327,16 +414,24 @@ function printResults(data) {
 async function main() {
   const args = process.argv.slice(2);
 
+  // --history: show uptime stats from saved history (no live check)
+  if (args.includes('--history')) {
+    printHistory();
+    return;
+  }
+
   if (args.includes('--json')) {
     const data = await check();
+    appendHistory(data);
     console.log(JSON.stringify(data, null, 2));
     process.exit(data.summary.down > 0 ? 1 : 0);
     return;
   }
 
   // Default: CLI table output
-  if (!args.includes('--serve') && !args.includes('--history')) {
+  if (!args.includes('--serve')) {
     const data = await check();
+    appendHistory(data);
     printResults(data);
     process.exit(data.summary.down > 0 ? 1 : 0);
   }
