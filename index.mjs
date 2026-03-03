@@ -16,11 +16,13 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import net from 'node:net';
+import { createServer } from 'node:http';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVICES_PATH = join(__dirname, 'services.json');
 const HISTORY_PATH = join(__dirname, 'history.json');
 const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const PORT = 3851;
 
 // ── Status Constants ────────────────────────────────────────────────────
 const STATUS = { UP: 'UP', DOWN: 'DOWN', SLOW: 'SLOW' };
@@ -360,6 +362,48 @@ function printHistory() {
   console.log(`${GY}${'─'.repeat(lineW)}${R}\n`);
 }
 
+// ── Web Dashboard ───────────────────────────────────────────────────────
+
+function renderDashboardHTML(data) {
+  const hist = loadHistory().slice(-30);
+  const sparks = {};
+  for (const e of hist) for (const r of e.results) (sparks[r.name] ??= []).push(r.status);
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const sc = s => s === 'UP' ? 'up' : s === 'SLOW' ? 'slow' : 'down';
+  const rows = data.results.map(r => {
+    const dots = (sparks[r.name] || []).slice(-24).map(s => `<i class="${sc(s)}"></i>`).join('');
+    return `<tr><td>${esc(r.name)}</td><td><b class="${sc(r.status)}">${r.status}</b></td><td>${r.responseTime}ms</td><td class="dim">${esc(r.detail)}</td><td class="spark">${dots}</td></tr>`;
+  }).join('');
+  const { up, down, slow, total } = data.summary;
+  const time = new Date(data.checkedAt).toLocaleTimeString('en-US', { hour12: false });
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Health Monitor</title><meta http-equiv="refresh" content="30">
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'JetBrains Mono','SF Mono',monospace;background:#0a0a0f;color:#e0e0e8;padding:24px;max-width:960px;margin:0 auto;line-height:1.5}h1{color:#67e8f9;font-size:1.4rem;margin-bottom:4px}.sub{color:#666;font-size:.85rem;margin-bottom:24px}.stats{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:24px}.sc{background:#12121a;border:1px solid #1e1e2e;border-radius:8px;padding:16px 20px;flex:1;min-width:120px}.sc .v{font-size:1.8rem;font-weight:700}.sc .l{font-size:.75rem;color:#666;text-transform:uppercase;letter-spacing:.5px}.green{color:#4ade80}.red{color:#f87171}.yellow{color:#facc15}.cyan{color:#67e8f9}table{width:100%;border-collapse:collapse;margin-top:12px}td{padding:8px 12px;border-bottom:1px solid #1a1a24;font-size:.85rem}tr:hover{background:#111118}b.up{color:#4ade80}b.slow{color:#facc15}b.down{color:#f87171}.dim{color:#555}.spark{white-space:nowrap}.spark i{display:inline-block;width:6px;height:16px;margin:0 1px;border-radius:2px;vertical-align:middle}.spark i.up{background:#4ade80}.spark i.slow{background:#facc15}.spark i.down{background:#f87171}footer{text-align:center;color:#333;font-size:.75rem;margin-top:32px}</style></head>
+<body><h1>⚡ Health Monitor</h1><div class="sub">${time} · Auto-refreshes every 30s</div>
+<div class="stats"><div class="sc"><div class="v cyan">${total}</div><div class="l">Services</div></div><div class="sc"><div class="v green">${up}</div><div class="l">Up</div></div><div class="sc"><div class="v ${down > 0 ? 'red' : 'green'}">${down}</div><div class="l">Down</div></div><div class="sc"><div class="v ${slow > 0 ? 'yellow' : 'green'}">${slow}</div><div class="l">Slow</div></div></div>
+<table><tr style="color:#888;font-size:.75rem;text-transform:uppercase;letter-spacing:1px"><td>Service</td><td>Status</td><td>Time</td><td>Detail</td><td>Uptime (recent)</td></tr>${rows}</table>
+<footer>health-monitor · ${new Date().toISOString().split('T')[0]}</footer></body></html>`;
+}
+
+async function serveDashboard() {
+  const server = createServer(async (req, res) => {
+    const data = await check();
+    appendHistory(data);
+    if (req.url === '/api/data') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify(data));
+    } else {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(renderDashboardHTML(data));
+    }
+  });
+  server.listen(PORT, () => {
+    console.log(`\n  ${B}${CY}⚡ Health Monitor${R} serving at ${B}http://localhost:${PORT}${R}`);
+    console.log(`  ${GY}API: http://localhost:${PORT}/api/data${R}`);
+    console.log(`  ${GY}Auto-refreshes every 30s${R}\n`);
+  });
+}
+
 // ── CLI Entrypoint ──────────────────────────────────────────────────────
 
 function statusColor(status) {
@@ -428,13 +472,16 @@ async function main() {
     return;
   }
 
-  // Default: CLI table output
-  if (!args.includes('--serve')) {
-    const data = await check();
-    appendHistory(data);
-    printResults(data);
-    process.exit(data.summary.down > 0 ? 1 : 0);
+  if (args.includes('--serve')) {
+    await serveDashboard();
+    return;
   }
+
+  // Default: CLI table output
+  const data = await check();
+  appendHistory(data);
+  printResults(data);
+  process.exit(data.summary.down > 0 ? 1 : 0);
 }
 
 // Only run CLI when executed directly (not when imported as module)
