@@ -1,0 +1,36 @@
+[
+  {
+    "name": "Agent Server",
+    "type": "http",
+    "url": "http://localhost:3001/api/health",
+    "timeout": 3000
+  },
+  {
+    "name": "Agent UI",
+    "type": "http",
+    "url": "http://localhost:3002",
+    "timeout": 3000
+  },
+  {
+    "name": "ICM Dashboard",
+    "type": "http",
+    "url": "http://localhost:3847",
+    "timeout": 3000
+  },
+  {
+    "name": "Daily Briefing",
+    "type": "http",
+    "url": "http://localhost:3850",
+    "timeout": 3000
+  },
+  {
+    "name": "Ollama",
+    "type": "http",
+    "url": "http://localhost:11434/api/tags",
+    "timeout": 5000
+  },
+  {
+    "name": "pm2 Processes",
+    "type": "pm2"
+  }
+]
