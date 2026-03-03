@@ -1,15 +1,6 @@
 #!/usr/bin/env node
-/**
- * health-monitor — Service Health Checker for Mac Mini
- *
- * Pings all configured services and reports their status.
- *
- * Usage:
- *   node index.mjs              # CLI health check
- *   node index.mjs --serve      # Web dashboard on port 3851
- *   node index.mjs --history    # Show uptime history (24h)
- *   node index.mjs --json       # Output raw JSON
- */
+// health-monitor — Service Health Checker for Mac Mini
+// Usage: node index.mjs [--serve|--history|--alerts|--json]
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -22,6 +13,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVICES_PATH = join(__dirname, 'services.json');
 const HISTORY_PATH = join(__dirname, 'history.json');
 const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const LAST_STATUS_PATH = join(__dirname, 'last-status.json');
+const ALERTS_PATH = join(__dirname, 'alerts.json');
+const ALERTS_MAX = 500;
 const PORT = 3851;
 
 // ── Status Constants ────────────────────────────────────────────────────
@@ -57,11 +51,6 @@ function loadServices() {
 
 // ── Check Implementations ───────────────────────────────────────────────
 
-/**
- * HTTP health check — fetch a URL, check for 2xx response
- * @param {Object} svc - { name, url, timeout? }
- * @returns {Object} { name, type, status, responseTime, detail }
- */
 async function checkHttp(svc) {
   const timeout = svc.timeout || 3000;
   const start = performance.now();
@@ -99,11 +88,6 @@ async function checkHttp(svc) {
   }
 }
 
-/**
- * Port-open check — attempt TCP connection
- * @param {Object} svc - { name, port, host?, timeout? }
- * @returns {Object} { name, type, status, responseTime, detail }
- */
 async function checkPort(svc) {
   const timeout = svc.timeout || 3000;
   const host = svc.host || 'localhost';
@@ -154,12 +138,6 @@ async function checkPort(svc) {
   });
 }
 
-/**
- * pm2 process status — parses `pm2 jlist` output
- * Returns one result per pm2 process
- * @param {Object} svc - { name }
- * @returns {Object[]} Array of results, one per pm2 process
- */
 function checkPm2(svc) {
   const start = performance.now();
   try {
@@ -228,11 +206,6 @@ function formatUptime(ms) {
 
 // ── Core Check Function ─────────────────────────────────────────────────
 
-/**
- * Run health checks on all configured services.
- * @param {Object} [options] - { services?: array, concurrency?: number }
- * @returns {Promise<Object>} { results: [...], summary: { total, up, down, slow }, checkedAt }
- */
 export async function check(options = {}) {
   const services = options.services || loadServices();
   const results = [];
@@ -288,10 +261,6 @@ function loadHistory() {
   }
 }
 
-/**
- * Append check results to history.json and prune entries older than 7 days.
- * Stores compact snapshots: { checkedAt, results: [{ name, status, responseTime }] }
- */
 function appendHistory(data) {
   const history = loadHistory();
   history.push({
@@ -308,9 +277,6 @@ function appendHistory(data) {
   writeFileSync(HISTORY_PATH, JSON.stringify(pruned, null, 2));
 }
 
-/**
- * Compute and print uptime % per service over the last 24 hours.
- */
 function printHistory() {
   const history = loadHistory();
   const cutoff24h = Date.now() - 24 * 60 * 60 * 1000;
@@ -389,6 +355,7 @@ async function serveDashboard() {
   const server = createServer(async (req, res) => {
     const data = await check();
     appendHistory(data);
+    processAlerts(data.results);
     if (req.url === '/api/data') {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify(data));
@@ -402,6 +369,56 @@ async function serveDashboard() {
     console.log(`  ${GY}API: http://localhost:${PORT}/api/data${R}`);
     console.log(`  ${GY}Auto-refreshes every 30s${R}\n`);
   });
+}
+
+// ── Alerting ────────────────────────────────────────────────────────────
+
+function processAlerts(results) {
+  let prev = {};
+  if (existsSync(LAST_STATUS_PATH)) try { prev = JSON.parse(readFileSync(LAST_STATUS_PATH, 'utf8')); } catch {}
+  const transitions = [];
+  for (const r of results) {
+    const p = prev[r.name];
+    if (p && (p === 'DOWN') !== (r.status === 'DOWN')) {
+      transitions.push({ timestamp: r.checkedAt, service: r.name, from: p, to: r.status, type: r.status === 'DOWN' ? 'outage' : 'recovery' });
+    }
+  }
+  // Persist current status map
+  const map = {};
+  for (const r of results) map[r.name] = r.status;
+  writeFileSync(LAST_STATUS_PATH, JSON.stringify(map));
+  if (!transitions.length) return transitions;
+  // Append to rolling alert log
+  let log = [];
+  if (existsSync(ALERTS_PATH)) try { log = JSON.parse(readFileSync(ALERTS_PATH, 'utf8')); } catch {}
+  log.push(...transitions);
+  if (log.length > ALERTS_MAX) log = log.slice(-ALERTS_MAX);
+  writeFileSync(ALERTS_PATH, JSON.stringify(log, null, 2));
+  // Notify: console output + mail thread for outages
+  const threadDir = '/Users/user/.openclaw/mail/threads';
+  for (const t of transitions) {
+    const icon = t.type === 'outage' ? `${RD}▼` : `${GR}▲`;
+    console.log(`  ${icon} ${B}${t.service}${R} ${t.from} → ${t.to}`);
+    if (t.type === 'outage' && existsSync(threadDir)) {
+      const slug = `health-alert-${t.service.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+      const fp = join(threadDir, `${slug}.md`);
+      if (!existsSync(fp)) writeFileSync(fp, `---\nproject: health-monitor\nagents: [claude]\nstatus: active\npriority: high\ncreated: ${t.timestamp}\nupdated: ${t.timestamp}\n---\n\n[health-monitor, ${t.timestamp}]\n🔴 **${t.service}** went DOWN (was ${t.from}).\nThis is an automated alert from health-monitor.\n`);
+    }
+  }
+  return transitions;
+}
+
+function printAlerts() {
+  let log = [];
+  if (existsSync(ALERTS_PATH)) try { log = JSON.parse(readFileSync(ALERTS_PATH, 'utf8')); } catch {}
+  if (!log.length) { console.log(`\n  ${GY}No alerts recorded yet.${R}\n`); return; }
+  console.log(`\n${B}${CY}⚡ Health Monitor — Alerts${R}  ${GY}(${log.length} total, showing last 20)${R}\n`);
+  for (const a of log.slice(-20)) {
+    const icon = a.type === 'outage' ? `${RD}▼${R}` : `${GR}▲${R}`;
+    const ts = new Date(a.timestamp).toLocaleString('en-US', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+    console.log(`  ${GY}${ts}${R}  ${icon} ${a.service.padEnd(20)}  ${a.from} → ${a.to}`);
+  }
+  console.log('');
 }
 
 // ── CLI Entrypoint ──────────────────────────────────────────────────────
@@ -464,9 +481,15 @@ async function main() {
     return;
   }
 
+  if (args.includes('--alerts')) {
+    printAlerts();
+    return;
+  }
+
   if (args.includes('--json')) {
     const data = await check();
     appendHistory(data);
+    processAlerts(data.results);
     console.log(JSON.stringify(data, null, 2));
     process.exit(data.summary.down > 0 ? 1 : 0);
     return;
@@ -480,6 +503,7 @@ async function main() {
   // Default: CLI table output
   const data = await check();
   appendHistory(data);
+  processAlerts(data.results);
   printResults(data);
   process.exit(data.summary.down > 0 ? 1 : 0);
 }
