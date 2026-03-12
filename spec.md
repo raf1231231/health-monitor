@@ -1,7 +1,11 @@
+---
+title: Health Monitor
+status: complete
+created: 2026-03-02
+agents: claude
+---
+
 # Health Monitor
-Status: complete
-Created: 2026-03-02
-Agents: claude
 
 ## Description
 Lightweight service health checker for the Mac Mini. Pings all known services (agent server, UI, dashboards, Ollama, pm2 processes), reports their status in the terminal with color-coded output, and optionally serves a web dashboard. Keeps a rolling history log so you can spot intermittent failures.

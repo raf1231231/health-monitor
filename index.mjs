@@ -16,11 +16,17 @@ const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const LAST_STATUS_PATH = join(__dirname, 'last-status.json');
 const ALERTS_PATH = join(__dirname, 'alerts.json');
 const ALERTS_MAX = 500;
-const PORT = 3851;
+const PORT = parseInt(process.env.HEALTH_MONITOR_PORT || '3851', 10);
+const CHECK_CACHE_TTL_MS = 15_000; // Cache health check results for 15 seconds
+const OVERALL_CHECK_TIMEOUT_MS = 35_000; // Max time for all checks combined
 
 // ── Status Constants ────────────────────────────────────────────────────
 const STATUS = { UP: 'UP', DOWN: 'DOWN', SLOW: 'SLOW' };
 const SLOW_THRESHOLD_MS = 2000;
+
+// ── Result Cache ────────────────────────────────────────────────────────
+let _cachedResult = null;
+let _cacheTimestamp = 0;
 
 // ── ANSI Colors ─────────────────────────────────────────────────────────
 const R = '\x1b[0m', B = '\x1b[1m';
@@ -34,9 +40,15 @@ function loadServices() {
     throw new Error(`Service registry not found: ${SERVICES_PATH}`);
   }
   const raw = readFileSync(SERVICES_PATH, 'utf8');
-  const services = JSON.parse(raw);
+  let services;
+  try { services = JSON.parse(raw); } catch (e) {
+    throw new Error(`services.json contains invalid JSON: ${e.message}`);
+  }
   if (!Array.isArray(services)) {
     throw new Error('services.json must be a JSON array');
+  }
+  if (services.length === 0) {
+    throw new Error('services.json is empty — add at least one service to monitor');
   }
   for (const svc of services) {
     if (!svc.name || !svc.type) {
@@ -59,6 +71,8 @@ async function checkHttp(svc) {
     const timer = setTimeout(() => controller.abort(), timeout);
     const res = await fetch(svc.url, { signal: controller.signal });
     clearTimeout(timer);
+    // Drain response body to release connection back to pool
+    try { await res.body?.cancel(); } catch {}
     const elapsed = Math.round(performance.now() - start);
     const ok = res.status >= 200 && res.status < 400;
     let status;
@@ -93,10 +107,17 @@ async function checkPort(svc) {
   const host = svc.host || 'localhost';
   const start = performance.now();
   return new Promise((resolve) => {
+    let settled = false;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(result);
+    };
     const socket = new net.Socket();
     const timer = setTimeout(() => {
-      socket.destroy();
-      resolve({
+      done({
         name: svc.name,
         type: 'port',
         status: STATUS.DOWN,
@@ -108,10 +129,8 @@ async function checkPort(svc) {
     }, timeout);
 
     socket.connect(svc.port, host, () => {
-      clearTimeout(timer);
-      socket.destroy();
       const elapsed = Math.round(performance.now() - start);
-      resolve({
+      done({
         name: svc.name,
         type: 'port',
         status: elapsed > SLOW_THRESHOLD_MS ? STATUS.SLOW : STATUS.UP,
@@ -123,9 +142,7 @@ async function checkPort(svc) {
     });
 
     socket.on('error', (err) => {
-      clearTimeout(timer);
-      socket.destroy();
-      resolve({
+      done({
         name: svc.name,
         type: 'port',
         status: STATUS.DOWN,
@@ -231,7 +248,13 @@ export async function check(options = {}) {
     }
   });
 
-  const allResults = await Promise.all(promises);
+  // Race against an overall timeout to prevent indefinite hangs
+  const allResults = await Promise.race([
+    Promise.all(promises),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Overall health check timed out after ${OVERALL_CHECK_TIMEOUT_MS}ms`)), OVERALL_CHECK_TIMEOUT_MS)
+    ),
+  ]);
   for (const batch of allResults) {
     results.push(...batch);
   }
@@ -250,6 +273,25 @@ export async function check(options = {}) {
   };
 }
 
+// ── Cached Check (for dashboard) ────────────────────────────────────────
+
+/**
+ * Returns cached health check results if fresh (within TTL), otherwise runs a new check.
+ * Prevents redundant checks when multiple page loads hit within a short window.
+ */
+async function cachedCheck() {
+  const now = Date.now();
+  if (_cachedResult && (now - _cacheTimestamp) < CHECK_CACHE_TTL_MS) {
+    return _cachedResult;
+  }
+  const data = await check();
+  _cachedResult = data;
+  _cacheTimestamp = now;
+  appendHistory(data);
+  processAlerts(data.results);
+  return data;
+}
+
 // ── History Log ─────────────────────────────────────────────────────────
 
 function loadHistory() {
@@ -262,19 +304,22 @@ function loadHistory() {
 }
 
 function appendHistory(data) {
-  const history = loadHistory();
-  history.push({
-    checkedAt: data.checkedAt,
-    results: data.results.map(r => ({
-      name: r.name,
-      status: r.status,
-      responseTime: r.responseTime,
-    })),
-  });
-  // Prune entries older than 7 days
-  const cutoff = Date.now() - HISTORY_MAX_AGE_MS;
-  const pruned = history.filter(entry => new Date(entry.checkedAt).getTime() > cutoff);
-  writeFileSync(HISTORY_PATH, JSON.stringify(pruned, null, 2));
+  try {
+    const history = loadHistory();
+    history.push({
+      checkedAt: data.checkedAt,
+      results: data.results.map(r => ({
+        name: r.name,
+        status: r.status,
+        responseTime: r.responseTime,
+      })),
+    });
+    const cutoff = Date.now() - HISTORY_MAX_AGE_MS;
+    const pruned = history.filter(entry => new Date(entry.checkedAt).getTime() > cutoff);
+    writeFileSync(HISTORY_PATH, JSON.stringify(pruned, null, 2));
+  } catch (e) {
+    console.error(`${YL}Warning: Failed to save history: ${e.message}${R}`);
+  }
 }
 
 function printHistory() {
@@ -352,22 +397,65 @@ function renderDashboardHTML(data) {
 }
 
 async function serveDashboard() {
+  const noCacheHeaders = { 'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache' };
   const server = createServer(async (req, res) => {
-    const data = await check();
-    appendHistory(data);
-    processAlerts(data.results);
-    if (req.url === '/api/data') {
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(JSON.stringify(data));
-    } else {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(renderDashboardHTML(data));
+    try {
+      const data = await cachedCheck();
+      if (req.url === '/api/data') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', ...noCacheHeaders });
+        res.end(JSON.stringify(data));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...noCacheHeaders });
+        res.end(renderDashboardHTML(data));
+      }
+    } catch (err) {
+      console.error(`${RD}Request error: ${err.message}${R}`);
+      if (!res.headersSent) {
+        if (req.url === '/api/data') {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Health check failed', detail: err.message }));
+        } else {
+          // Return a styled error page instead of raw JSON
+          const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+          res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="30">
+<title>Health Monitor — Error</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'JetBrains Mono','SF Mono',monospace;background:#0a0a0f;color:#e0e0e8;padding:48px;max-width:600px;margin:60px auto;text-align:center}h1{color:#f87171;font-size:1.4rem;margin-bottom:16px}.msg{color:#888;font-size:.9rem;margin-bottom:24px;line-height:1.6}.detail{background:#12121a;border:1px solid #2a1a1a;border-radius:8px;padding:16px;color:#f87171;font-size:.8rem;word-break:break-all}footer{color:#333;font-size:.75rem;margin-top:32px}</style></head>
+<body><h1>⚡ Health Check Failed</h1><div class="msg">Unable to complete health checks. Retrying in 30 seconds…</div>
+<div class="detail">${esc(err.message)}</div><footer>health-monitor · ${new Date().toISOString().split('T')[0]}</footer></body></html>`);
+        }
+      }
     }
   });
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`${RD}Fatal: Port ${PORT} is already in use.${R} Stop the other process or choose a different port.`);
+    } else {
+      console.error(`${RD}Server error: ${err.message}${R}`);
+    }
+    process.exit(2);
+  });
+
+  // ── Graceful Shutdown ───────────────────────────────────────────────
+  const shutdown = (signal) => {
+    console.log(`\n  ${YL}Received ${signal}, shutting down gracefully…${R}`);
+    server.close(() => {
+      console.log(`  ${GY}Server closed.${R}`);
+      process.exit(0);
+    });
+    // Force exit after 10s if connections don't drain
+    setTimeout(() => {
+      console.error(`  ${RD}Forcing exit after 10s timeout.${R}`);
+      process.exit(1);
+    }, 10_000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
   server.listen(PORT, () => {
     console.log(`\n  ${B}${CY}⚡ Health Monitor${R} serving at ${B}http://localhost:${PORT}${R}`);
     console.log(`  ${GY}API: http://localhost:${PORT}/api/data${R}`);
-    console.log(`  ${GY}Auto-refreshes every 30s${R}\n`);
+    console.log(`  ${GY}Auto-refreshes every 30s · Results cached ${CHECK_CACHE_TTL_MS / 1000}s${R}\n`);
   });
 }
 
@@ -375,34 +463,43 @@ async function serveDashboard() {
 
 function processAlerts(results) {
   let prev = {};
-  if (existsSync(LAST_STATUS_PATH)) try { prev = JSON.parse(readFileSync(LAST_STATUS_PATH, 'utf8')); } catch {}
+  if (existsSync(LAST_STATUS_PATH)) try { prev = JSON.parse(readFileSync(LAST_STATUS_PATH, 'utf8')); } catch (e) {
+    console.error(`${YL}Warning: last-status.json corrupted, resetting alert state: ${e.message}${R}`);
+  }
   const transitions = [];
   for (const r of results) {
+    if (!(r.name in prev)) continue; // Skip on first-ever check for this service
     const p = prev[r.name];
-    if (p && (p === 'DOWN') !== (r.status === 'DOWN')) {
+    if ((p === 'DOWN') !== (r.status === 'DOWN')) {
       transitions.push({ timestamp: r.checkedAt, service: r.name, from: p, to: r.status, type: r.status === 'DOWN' ? 'outage' : 'recovery' });
     }
   }
   // Persist current status map
   const map = {};
   for (const r of results) map[r.name] = r.status;
-  writeFileSync(LAST_STATUS_PATH, JSON.stringify(map));
+  try { writeFileSync(LAST_STATUS_PATH, JSON.stringify(map)); } catch (e) {
+    console.error(`${YL}Warning: Failed to save status map: ${e.message}${R}`);
+  }
   if (!transitions.length) return transitions;
   // Append to rolling alert log
   let log = [];
   if (existsSync(ALERTS_PATH)) try { log = JSON.parse(readFileSync(ALERTS_PATH, 'utf8')); } catch {}
   log.push(...transitions);
   if (log.length > ALERTS_MAX) log = log.slice(-ALERTS_MAX);
-  writeFileSync(ALERTS_PATH, JSON.stringify(log, null, 2));
+  try { writeFileSync(ALERTS_PATH, JSON.stringify(log, null, 2)); } catch (e) {
+    console.error(`${YL}Warning: Failed to save alert log: ${e.message}${R}`);
+  }
   // Notify: console output + mail thread for outages
   const threadDir = '/Users/user/.openclaw/mail/threads';
   for (const t of transitions) {
     const icon = t.type === 'outage' ? `${RD}▼` : `${GR}▲`;
     console.log(`  ${icon} ${B}${t.service}${R} ${t.from} → ${t.to}`);
     if (t.type === 'outage' && existsSync(threadDir)) {
-      const slug = `health-alert-${t.service.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
-      const fp = join(threadDir, `${slug}.md`);
-      if (!existsSync(fp)) writeFileSync(fp, `---\nproject: health-monitor\nagents: [claude]\nstatus: active\npriority: high\ncreated: ${t.timestamp}\nupdated: ${t.timestamp}\n---\n\n[health-monitor, ${t.timestamp}]\n🔴 **${t.service}** went DOWN (was ${t.from}).\nThis is an automated alert from health-monitor.\n`);
+      try {
+        const slug = `health-alert-${t.service.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+        const fp = join(threadDir, `${slug}.md`);
+        if (!existsSync(fp)) writeFileSync(fp, `---\nproject: health-monitor\nagents: [claude]\nstatus: active\npriority: high\ncreated: ${t.timestamp}\nupdated: ${t.timestamp}\n---\n\n[health-monitor, ${t.timestamp}]\n🔴 **${t.service}** went DOWN (was ${t.from}).\nThis is an automated alert from health-monitor.\n`);
+      } catch (e) { console.error(`${YL}Warning: Failed to create alert thread: ${e.message}${R}`); }
     }
   }
   return transitions;
@@ -473,6 +570,11 @@ function printResults(data) {
 }
 
 async function main() {
+  // Catch unhandled rejections to prevent silent daemon crashes (especially in --serve mode)
+  process.on('unhandledRejection', (reason) => {
+    console.error(`${RD}Unhandled rejection: ${reason instanceof Error ? reason.message : reason}${R}`);
+  });
+
   const args = process.argv.slice(2);
 
   // --history: show uptime stats from saved history (no live check)
