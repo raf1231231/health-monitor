@@ -285,3 +285,99 @@ This deployment monitors the following services:
 ## License
 
 MIT
+
+---
+
+## Troubleshooting
+
+### Services showing as DOWN
+
+1. **Check if the service is running:**
+   ```bash
+   curl http://localhost:3001/api/health
+   pm2 list
+   ```
+
+2. **Check the port is open:**
+   ```bash
+   lsof -i :3001
+   ```
+
+3. **Verify timeout settings** — some services may need longer timeouts if they're slow to respond.
+
+### Dashboard not loading
+
+1. Verify the port is not in use:
+   ```bash
+   lsof -i :3851
+   ```
+
+2. Check the environment variable:
+   ```bash
+   HEALTH_MONITOR_PORT=3851 node index.mjs --serve
+   ```
+
+### History not persisting
+
+- Ensure the process has write permissions to the project directory
+- Check `history.json` exists and is valid JSON
+
+## Alerting
+
+When a service transitions state (UP→DOWN or DOWN→UP), the monitor logs the event to `alerts.json`:
+
+```json
+[
+  {
+    "timestamp": "2026-03-13T06:27:26.567Z",
+    "service": "Agent UI",
+    "from": "UP",
+    "to": "DOWN",
+    "type": "outage"
+  }
+]
+```
+
+### Alert Types
+
+- **outage** — Service went DOWN
+- **recovery** — Service came back UP
+
+View recent alerts:
+```bash
+node index.mjs --alerts
+```
+
+## Cron Integration
+
+Run health checks automatically on a schedule:
+
+```bash
+# Every 5 minutes
+*/5 * * * * cd /path/to/health-monitor && node index.mjs >> /var/log/health.log 2>&1
+```
+
+Or run as a daemon with automatic serving:
+
+```bash
+# Start dashboard and health checker as PM2 process
+pm2 start index.mjs --name health-monitor -- serve
+pm2 save
+```
+
+## Programmatic Usage
+
+Import the health checker in other Node.js scripts:
+
+```javascript
+import { checkService, loadServices } from './index.mjs';
+
+const services = await loadServices();
+const results = await Promise.all(services.map(checkService));
+
+console.log(results);
+// [
+//   { name: "agent-server", status: "UP", responseTime: 45 },
+//   ...
+// ]
+```
