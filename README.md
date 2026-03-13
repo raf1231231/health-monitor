@@ -282,6 +282,174 @@ This deployment monitors the following services:
 | Ollama | HTTP | http://localhost:11434/api/tags | 5s |
 | pm2 Processes | PM2 | — | — |
 
+## Rolling History
+
+Health check results are stored in `history.json` with a rolling 7-day window.
+
+### History Entry Format
+
+```json
+{
+  "timestamp": "2026-03-13T07:00:00.000Z",
+  "services": [
+    {
+      "name": "agent-server",
+      "status": "UP",
+      "responseTime": 45
+    }
+  ],
+  "summary": {
+    "total": 5,
+    "up": 5,
+    "down": 0,
+    "slow": 0
+  }
+}
+```
+
+### Query Historical Uptime
+
+```bash
+# View uptime for last 24 hours
+node index.mjs --history
+
+# Output example:
+# Service          | Uptime  | Checks | Avg Response
+# -----------------|---------|--------|--------------
+# agent-server     | 100.0%  | 288    | 45ms
+# agent-ui         | 99.2%   | 287    | 12ms
+```
+
+### Calculate Custom Uptime Periods
+
+```javascript
+import { readFileSync } from 'fs';
+
+const history = JSON.parse(readFileSync('./history.json', 'utf8'));
+
+// Calculate uptime for last hour
+const oneHourAgo = new Date(Date.now() - 3600000);
+const recentChecks = history.filter(h => new Date(h.timestamp) > oneHourAgo);
+
+const total = recentChecks.length;
+const up = recentChecks.filter(h => h.summary.down === 0).length;
+const uptimePercent = total > 0 ? (up / total) * 100 : 0;
+
+console.log(`Last hour uptime: ${uptimePercent.toFixed(1)}%`);
+```
+
+---
+
+## Custom Timeout Examples
+
+Override default timeouts per service in `services.json`:
+
+```json
+[
+  {
+    "name": "ollama",
+    "type": "http",
+    "url": "http://localhost:11434/api/tags",
+    "timeout": 10000
+  },
+  {
+    "name": "slow-service",
+    "type": "http",
+    "url": "http://localhost:9000/health",
+    "timeout": 30000
+  }
+]
+```
+
+### Default Timeouts
+
+- HTTP checks: 5000ms (5 seconds)
+- Can be overridden per-service
+
+---
+
+## Alert Webhook Integration
+
+Send alerts to external systems via webhook:
+
+```bash
+# Configure webhook in services.json
+node index.mjs --webhook "https://hooks.example.com/alert"
+```
+
+Or use environment variable:
+
+```bash
+HEALTH_WEBHOOK_URL="https://hooks.example.com/alert" node index.mjs
+```
+
+### Webhook Payload
+
+```json
+{
+  "event": "state_change",
+  "service": "agent-server",
+  "from": "UP",
+  "to": "DOWN",
+  "timestamp": "2026-03-13T07:00:00.000Z",
+  "details": {
+    "responseTime": 5002,
+    "error": "timeout"
+  }
+}
+```
+
+---
+
+## Integration with Other Tools
+
+### Nagios/Icinga Plugin Format
+
+```bash
+node index.mjs --json | jq -r '
+  if .summary.down > 0 then
+    "CRITICAL: \(.summary.down) service(s) down"
+  elif .summary.slow > 0 then
+    "WARNING: \(.summary.slow) service(s) slow"
+  else
+    "OK: All services healthy"
+  end
+'
+```
+
+### Prometheus Exporter
+
+```bash
+# Simple Prometheus metrics endpoint
+node index.mjs --serve --metrics
+```
+
+Outputs:
+```
+# HELP health_service_status Service status (1=up, 0=down)
+# TYPE health_service_status gauge
+health_service_status{service="agent-server"} 1
+health_service_status{service="ollama"} 1
+
+# HELP health_response_time_ms Service response time in milliseconds
+# TYPE health_response_time_ms gauge
+health_response_time_ms{service="agent-server"} 45
+```
+
+### Home Assistant
+
+Add to `configuration.yaml`:
+```yaml
+sensor:
+  - platform: rest
+    name: Health Monitor
+    resource: http://localhost:3851/api/data
+    value_template: "{{ value_json.summary.up }}/{{ value_json.summary.total }}"
+    unit_of_measurement: "services"
+```
+
+---
+
 ## License
 
 MIT
