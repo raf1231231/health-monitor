@@ -46,6 +46,165 @@ node index.mjs --history
 
 Shows uptime percentage per service over the last 24 hours.
 
+### View Recent Alerts
+
+```bash
+node index.mjs --alerts
+```
+
+Shows recent state transitions (UP→DOWN or DOWN→UP).
+
+### JSON Output
+
+```bash
+node index.mjs --json
+```
+
+Outputs raw JSON for scripting.
+
+---
+
+## Health Check Types
+
+The monitor supports three check types, configured in `services.json`:
+
+### 1. HTTP Check (`type: "http"`)
+
+Pings an HTTP endpoint and verifies a successful response.
+
+**Configuration:**
+```json
+{
+  "name": "agent-server",
+  "type": "http",
+  "url": "http://localhost:3001/api/health"
+}
+```
+
+**Response States:**
+- **UP** — HTTP 2xx response within timeout (default 5s)
+- **SLOW** — Response received but took >3s
+- **DOWN** — Connection failed, timeout, or non-2xx response
+
+**Example Response:**
+```json
+{
+  "name": "agent-server",
+  "status": "UP",
+  "responseTime": 45,
+  "checkedAt": "2026-03-13T01:00:00.000Z"
+}
+```
+
+### 2. Port Check (`type: "port"`)
+
+Verifies a TCP port is open and accepting connections.
+
+**Configuration:**
+```json
+{
+  "name": "database",
+  "type": "port",
+  "port": 5432
+}
+```
+
+**Response States:**
+- **UP** — Port is open
+- **DOWN** — Port is closed or unreachable
+
+**Example Response:**
+```json
+{
+  "name": "database",
+  "status": "UP",
+  "responseTime": 2,
+  "checkedAt": "2026-03-13T01:00:00.000Z"
+}
+```
+
+### 3. PM2 Process Check (`type: "pm2"`)
+
+Verifies a PM2 process is running.
+
+**Configuration:**
+```json
+{
+  "name": "agent-server",
+  "type": "pm2",
+  "process": "agent-server"
+}
+```
+
+**Response States:**
+- **UP** — Process is running (status "online" or "launching")
+- **STOPPED** — Process exists but not running (status "stopped", "errored", "one-launch-status")
+- **DOWN** — Process not found in PM2 list
+
+**Example Response:**
+```json
+{
+  "name": "agent-server",
+  "status": "UP",
+  "pm2Status": "online",
+  "cpu": 2.1,
+  "memory": 145678900,
+  "checkedAt": "2026-03-13T01:00:00.000Z"
+}
+```
+
+---
+
+## Web Dashboard API
+
+When running with `--serve`, the dashboard exposes:
+
+### GET /
+
+Returns the HTML dashboard with auto-refresh every 30 seconds.
+
+### GET /api/data
+
+Returns JSON health data for all services.
+
+**Response Format:**
+```json
+{
+  "checkedAt": "2026-03-13T01:00:00.000Z",
+  "services": [
+    {
+      "name": "agent-server",
+      "type": "http",
+      "status": "UP",
+      "responseTime": 45,
+      "detail": "200 OK"
+    },
+    {
+      "name": "database",
+      "type": "port",
+      "status": "UP",
+      "responseTime": 2
+    },
+    {
+      "name": "agent-server",
+      "type": "pm2",
+      "status": "UP",
+      "pm2Status": "online",
+      "cpu": 2.1,
+      "memory": 145678900
+    }
+  ],
+  "summary": {
+    "total": 5,
+    "up": 5,
+    "down": 0,
+    "slow": 0
+  }
+}
+```
+
+---
+
 ## Configuration
 
 ### Services Registry (services.json)
@@ -63,6 +222,11 @@ Define services to monitor:
     "name": "agent-ui",
     "type": "http", 
     "url": "http://localhost:3000"
+  },
+  {
+    "name": "ollama",
+    "type": "http",
+    "url": "http://localhost:11434/api/tags"
   },
   {
     "name": "pm2-process",
