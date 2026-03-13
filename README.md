@@ -269,6 +269,19 @@ health-monitor/
 - `0` — All services healthy
 - `1` — One or more services down or slow
 
+## Monitored Services
+
+This deployment monitors the following services:
+
+| Service | Type | Endpoint | Timeout |
+|---------|------|----------|---------|
+| Agent Server | HTTP | http://localhost:3001/api/health | 3s |
+| Agent UI | HTTP | http://localhost:3002 | 3s |
+| ICM Dashboard | HTTP | http://localhost:3847 | 3s |
+| Daily Briefing | HTTP | http://localhost:3850 | 3s |
+| Ollama | HTTP | http://localhost:11434/api/tags | 5s |
+| pm2 Processes | PM2 | — | — |
+
 ## License
 
 MIT
